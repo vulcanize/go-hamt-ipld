@@ -885,24 +885,29 @@ func (n *Node) ForEach(ctx context.Context, f func(k string, val *cbg.Deferred) 
 // This method also provides the trail of indices to the current node, which can be used to formulate a selector suffix
 func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) error {
 	idx := 0
+	l := len(trail)
 	for _, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
 		for n.Bitfield.Bit(idx) == 0 {
 			idx++
 		}
-		trail = append(trail, idx)
+
+		subTrail := make([]int, l, l+1)
+		copy(subTrail, trail)
+		subTrail = append(subTrail, idx)
+
 		if p.isShard() {
 			chnd, err := p.loadChild(ctx, n.store, n.bitWidth, n.hash)
 			if err != nil {
 				return err
 			}
 
-			if err := chnd.ForEachTracked(ctx, trail, f); err != nil {
+			if err := chnd.ForEachTracked(ctx, subTrail, f); err != nil {
 				return err
 			}
 		} else {
 			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, trail); err != nil {
+				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
 					return err
 				}
 			}
@@ -932,24 +937,29 @@ func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, trail []int, b *b
 		}
 	}
 	idx := 0
+	l := len(trail)
 	for _, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
 		for n.Bitfield.Bit(idx) == 0 {
 			idx++
 		}
-		trail = append(trail, idx)
+
+		subTrail := make([]int, l, l+1)
+		copy(subTrail, trail)
+		subTrail = append(subTrail, idx)
+
 		if p.isShard() {
 			chnd, err := p.loadChild(ctx, n.store, n.bitWidth, n.hash)
 			if err != nil {
 				return err
 			}
 
-			if err := chnd.ForEachTrackedWithNodeSink(ctx, trail, b, sink, f); err != nil {
+			if err := chnd.ForEachTrackedWithNodeSink(ctx, subTrail, b, sink, f); err != nil {
 				return err
 			}
 		} else {
 			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, trail); err != nil {
+				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
 					return err
 				}
 			}
