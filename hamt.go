@@ -897,8 +897,8 @@ func (n *Node) ForEach(ctx context.Context, f func(k string, val *cbg.Deferred) 
 // a large number of loads from the underlying store.
 // The values are returned as raw bytes, not decoded.
 // Unlike ForEach this runs in parallel so passed callbacks should not conflict with each other
-func (n *Node) ForEachParallel(ctx context.Context, f func(k string, val *cbg.Deferred) error) error {
-	return parallelShardWalk(ctx, n, f)
+func (n *Node) ForEachParallel(ctx context.Context, f func(k string, val *cbg.Deferred) error, concurrency int) error {
+	return parallelShardWalk(ctx, n, f, concurrency)
 }
 
 type OptionalInteger struct {
@@ -934,9 +934,7 @@ func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCid
 }
 
 // parallelShardWalk walks the HAMT concurrently processing callbacks upon encountering leaf nodes
-func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(k string, val *cbg.Deferred) error) error {
-	const concurrency = 16 // TODO: should be an option, also this number was basically made up with a bit of empirical testing/usage
-
+func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(k string, val *cbg.Deferred) error, concurrency int) error {
 	var visitlk sync.Mutex
 	visitSet := cid.NewSet()
 	visit := visitSet.Visit
