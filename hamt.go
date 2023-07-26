@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"math/big"
 	"sort"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 
 	cid "github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
@@ -996,12 +997,6 @@ type OptionalInteger struct {
 	Error error
 }
 
-// TODO: This interface is obviously wrong, but we may want some GetMany-style grouping or even a "session" object
-// we can push CIDs into to leverage efficiencies without tons of goroutines
-type getManyIPLDStore interface {
-	GetMany(ctx context.Context, cids []cid.Cid, outs []interface{}) <-chan *OptionalInteger
-}
-
 type listCidsAndShards struct {
 	cids   []cid.Cid
 	shards []*Node
@@ -1075,17 +1070,23 @@ func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(
 				}
 
 				// TODO: allow for Pointer caching
-				dserv := root.store.(getManyIPLDStore)
+				dserv := root.store.(cbor.IpldGetManyStore)
 				nodes := make([]interface{}, len(linksToVisit))
 				for i := 0; i < len(linksToVisit); i++ {
 					nodes[i] = new(Node)
 				}
-				chNodes := dserv.GetMany(errGrpCtx, linksToVisit, nodes)
-				for optNode := range chNodes {
-					if optNode.Error != nil {
-						return optNode.Error
+				cursorChan, missingCIDs, err := dserv.GetMany(errGrpCtx, linksToVisit, nodes)
+				if err != nil {
+					return err
+				}
+				if len(missingCIDs) != 0 {
+					return fmt.Errorf("GetMany returned an incomplete result set. The set is missing these CIDs: %+v", missingCIDs)
+				}
+				for cursor := range cursorChan {
+					if cursor.Err != nil {
+						return cursor.Err
 					}
-					nextShard := nodes[optNode.Value].(*Node)
+					nextShard := nodes[cursor.Index].(*Node)
 					nextShard.store = root.store
 					nextShard.bitWidth = root.bitWidth
 					nextShard.hash = root.hash
