@@ -3,7 +3,7 @@ module github.com/filecoin-project/go-hamt-ipld/v3
 require (
 	github.com/ipfs/go-block-format v0.0.2
 	github.com/ipfs/go-cid v0.0.6
-	github.com/ipfs/go-ipld-cbor v0.0.4
+	github.com/ipfs/go-ipld-cbor v0.0.6
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.7.0
 	github.com/whyrusleeping/cbor-gen v0.0.0-20220323183124-98fa8256a799
@@ -33,3 +33,5 @@ require (
 )
 
 go 1.18
+
+replace github.com/ipfs/go-ipld-cbor => /Users/iannorden/go/src/github.com/ipfs/go-ipld-cbor
