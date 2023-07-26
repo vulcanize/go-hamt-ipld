@@ -992,11 +992,6 @@ func (n *Node) ForEachParallel(ctx context.Context, f func(k string, val *cbg.De
 	return parallelShardWalk(ctx, n, f, concurrency)
 }
 
-type OptionalInteger struct {
-	Value int
-	Error error
-}
-
 type listCidsAndShards struct {
 	cids   []cid.Cid
 	shards []*Node

@@ -47,10 +47,10 @@ func (mb *mockBlocks) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 func (mb *mockBlocks) GetMany(ctx context.Context, cs []cid.Cid) ([]block.Block, []cid.Cid, error) {
 	mb.dataMu.Lock()
 	defer mb.dataMu.Unlock()
-	mb.stats.evtcntGet++
 	blocks := make([]block.Block, 0, len(cs))
 	missingCIDs := make([]cid.Cid, 0, len(cs))
 	for _, c := range cs {
+		mb.stats.evtcntGet++
 		d, ok := mb.data[c]
 		if !ok {
 			missingCIDs = append(missingCIDs, c)
