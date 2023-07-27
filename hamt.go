@@ -992,9 +992,23 @@ func (n *Node) ForEachParallel(ctx context.Context, f func(k string, val *cbg.De
 	return parallelShardWalk(ctx, n, f, concurrency)
 }
 
+func (n *Node) ForEachParallelTracked(ctx context.Context, trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	return parallelShardWalkTracked(ctx, n, trail, f, concurrency)
+}
+
+func (n *Node) ForEachParallelTrackedWithNodeSink(ctx context.Context, trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	return parallelShardWalkTrackedWithNodeSink(ctx, n, trail, b, sink, f, concurrency)
+}
+
 type listCidsAndShards struct {
 	cids   []cid.Cid
 	shards []*Node
+}
+
+type listCidsAndShardsTracked struct {
+	cids   []cid.Cid
+	shards []*Node
+	trail  []int
 }
 
 func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCidsAndShards, error) {
@@ -1010,6 +1024,89 @@ func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCid
 		} else {
 			for _, kv := range p.KVs {
 				if err := f(string(kv.Key), kv.Value); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return res, nil
+}
+
+func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
+	res := &listCidsAndShardsTracked{}
+
+	idx := 0
+	l := len(trail)
+
+	for _, p := range n.Pointers {
+		// Seek the next set bit in the bitfield to find the actual index for this pointer
+		for n.Bitfield.Bit(idx) == 0 {
+			idx++
+		}
+
+		subTrail := make([]int, l, l+1)
+		copy(subTrail, trail)
+		subTrail = append(subTrail, idx)
+
+		if p.isShard() {
+			if p.cache != nil {
+				res.shards = append(res.shards, p.cache)
+			} else {
+				res.cids = append(res.cids, p.Link)
+			}
+			res.trail = subTrail
+		} else {
+			for _, kv := range p.KVs {
+				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return res, nil
+}
+
+func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
+	if sink != nil {
+		if b == nil {
+			b = bytes.NewBuffer(nil)
+		}
+		b.Reset()
+		if err := n.MarshalCBOR(b); err != nil {
+			return nil, err
+		}
+		if err := sink.UnmarshalCBOR(b); err != nil {
+			return nil, err
+		}
+	}
+
+	res := &listCidsAndShardsTracked{}
+
+	idx := 0
+	l := len(trail)
+
+	for _, p := range n.Pointers {
+		// Seek the next set bit in the bitfield to find the actual index for this pointer
+		for n.Bitfield.Bit(idx) == 0 {
+			idx++
+		}
+
+		subTrail := make([]int, l, l+1)
+		copy(subTrail, trail)
+		subTrail = append(subTrail, idx)
+
+		if p.isShard() {
+			if p.cache != nil {
+				res.shards = append(res.shards, p.cache)
+			} else {
+				res.cids = append(res.cids, p.Link)
+			}
+			res.trail = subTrail
+		} else {
+			for _, kv := range p.KVs {
+				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
 					return nil, err
 				}
 			}
@@ -1114,6 +1211,266 @@ func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(
 
 	next := &listCidsAndShards{
 		shards: []*Node{root},
+	}
+
+dispatcherLoop:
+	for {
+		select {
+		case send <- next:
+			inProgress++
+			if len(todoQueue) > 0 {
+				next = todoQueue[0]
+				todoQueue = todoQueue[1:]
+			} else {
+				next = nil
+				send = nil
+			}
+		case <-done:
+			inProgress--
+			if inProgress == 0 && next == nil {
+				break dispatcherLoop
+			}
+		case nextNodes := <-out:
+			if next == nil {
+				next = nextNodes
+				send = feed
+			} else {
+				todoQueue = append(todoQueue, nextNodes)
+			}
+		case <-errGrpCtx.Done():
+			break dispatcherLoop
+		}
+	}
+	close(feed)
+	return grp.Wait()
+}
+
+// parallelShardWalkTracked walks the HAMT concurrently processing callbacks upon encountering leaf nodes
+func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	var visitlk sync.Mutex
+	visitSet := cid.NewSet()
+	visit := visitSet.Visit
+
+	// Setup synchronization
+	grp, errGrpCtx := errgroup.WithContext(ctx)
+
+	// Input and output queues for workers.
+	feed := make(chan *listCidsAndShardsTracked)
+	out := make(chan *listCidsAndShardsTracked)
+	done := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		grp.Go(func() error {
+			for feedChildren := range feed {
+				for _, nextShard := range feedChildren.shards {
+					nextChildren, err := nextShard.walkChildrenTracked(feedChildren.trail, processShardValues)
+					if err != nil {
+						return err
+					}
+
+					select {
+					case out <- nextChildren:
+					case <-errGrpCtx.Done():
+						return nil
+					}
+				}
+
+				var linksToVisit []cid.Cid
+				for _, nextCid := range feedChildren.cids {
+					var shouldVisit bool
+
+					visitlk.Lock()
+					shouldVisit = visit(nextCid)
+					visitlk.Unlock()
+
+					if shouldVisit {
+						linksToVisit = append(linksToVisit, nextCid)
+					}
+				}
+
+				// TODO: allow for Pointer caching
+				dserv := root.store.(cbor.IpldGetManyStore)
+				nodes := make([]interface{}, len(linksToVisit))
+				for i := 0; i < len(linksToVisit); i++ {
+					nodes[i] = new(Node)
+				}
+				cursorChan, missingCIDs, err := dserv.GetMany(errGrpCtx, linksToVisit, nodes)
+				if err != nil {
+					return err
+				}
+				if len(missingCIDs) != 0 {
+					return fmt.Errorf("GetMany returned an incomplete result set. The set is missing these CIDs: %+v", missingCIDs)
+				}
+				for cursor := range cursorChan {
+					if cursor.Err != nil {
+						return cursor.Err
+					}
+					nextShard := nodes[cursor.Index].(*Node)
+					nextShard.store = root.store
+					nextShard.bitWidth = root.bitWidth
+					nextShard.hash = root.hash
+					if err := validateNode(*nextShard, false); err != nil {
+						return err
+					}
+
+					nextChildren, err := nextShard.walkChildrenTracked(feedChildren.trail, processShardValues)
+					if err != nil {
+						return err
+					}
+
+					select {
+					case out <- nextChildren:
+					case <-errGrpCtx.Done():
+						return nil
+					}
+				}
+
+				select {
+				case done <- struct{}{}:
+				case <-errGrpCtx.Done():
+				}
+			}
+			return nil
+		})
+	}
+
+	send := feed
+	var todoQueue []*listCidsAndShardsTracked
+	var inProgress int
+
+	next := &listCidsAndShardsTracked{
+		shards: []*Node{root},
+		trail:  trail,
+	}
+
+dispatcherLoop:
+	for {
+		select {
+		case send <- next:
+			inProgress++
+			if len(todoQueue) > 0 {
+				next = todoQueue[0]
+				todoQueue = todoQueue[1:]
+			} else {
+				next = nil
+				send = nil
+			}
+		case <-done:
+			inProgress--
+			if inProgress == 0 && next == nil {
+				break dispatcherLoop
+			}
+		case nextNodes := <-out:
+			if next == nil {
+				next = nextNodes
+				send = feed
+			} else {
+				todoQueue = append(todoQueue, nextNodes)
+			}
+		case <-errGrpCtx.Done():
+			break dispatcherLoop
+		}
+	}
+	close(feed)
+	return grp.Wait()
+}
+
+// parallelShardWalkTrackedWithNodeSink walks the HAMT concurrently processing callbacks upon encountering leaf nodes
+func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	var visitlk sync.Mutex
+	visitSet := cid.NewSet()
+	visit := visitSet.Visit
+
+	// Setup synchronization
+	grp, errGrpCtx := errgroup.WithContext(ctx)
+
+	// Input and output queues for workers.
+	feed := make(chan *listCidsAndShardsTracked)
+	out := make(chan *listCidsAndShardsTracked)
+	done := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		grp.Go(func() error {
+			for feedChildren := range feed {
+				for _, nextShard := range feedChildren.shards {
+					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(feedChildren.trail, b, sink, processShardValues)
+					if err != nil {
+						return err
+					}
+
+					select {
+					case out <- nextChildren:
+					case <-errGrpCtx.Done():
+						return nil
+					}
+				}
+
+				var linksToVisit []cid.Cid
+				for _, nextCid := range feedChildren.cids {
+					var shouldVisit bool
+
+					visitlk.Lock()
+					shouldVisit = visit(nextCid)
+					visitlk.Unlock()
+
+					if shouldVisit {
+						linksToVisit = append(linksToVisit, nextCid)
+					}
+				}
+
+				// TODO: allow for Pointer caching
+				dserv := root.store.(cbor.IpldGetManyStore)
+				nodes := make([]interface{}, len(linksToVisit))
+				for i := 0; i < len(linksToVisit); i++ {
+					nodes[i] = new(Node)
+				}
+				cursorChan, missingCIDs, err := dserv.GetMany(errGrpCtx, linksToVisit, nodes)
+				if err != nil {
+					return err
+				}
+				if len(missingCIDs) != 0 {
+					return fmt.Errorf("GetMany returned an incomplete result set. The set is missing these CIDs: %+v", missingCIDs)
+				}
+				for cursor := range cursorChan {
+					if cursor.Err != nil {
+						return cursor.Err
+					}
+					nextShard := nodes[cursor.Index].(*Node)
+					nextShard.store = root.store
+					nextShard.bitWidth = root.bitWidth
+					nextShard.hash = root.hash
+					if err := validateNode(*nextShard, false); err != nil {
+						return err
+					}
+
+					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(feedChildren.trail, b, sink, processShardValues)
+					if err != nil {
+						return err
+					}
+
+					select {
+					case out <- nextChildren:
+					case <-errGrpCtx.Done():
+						return nil
+					}
+				}
+
+				select {
+				case done <- struct{}{}:
+				case <-errGrpCtx.Done():
+				}
+			}
+			return nil
+		})
+	}
+
+	send := feed
+	var todoQueue []*listCidsAndShardsTracked
+	var inProgress int
+
+	next := &listCidsAndShardsTracked{
+		shards: []*Node{root},
+		trail:  trail,
 	}
 
 dispatcherLoop:
