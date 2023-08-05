@@ -653,7 +653,8 @@ func testForEachParallel(t *testing.T, options ...Option) {
 		kvs[k] = valueBuf.Bytes()
 	}
 	require.NoError(t, begn.Flush(ctx))
-
+	c, err := cs.Put(ctx, begn)
+	require.NoError(t, err)
 	called := 0
 	f := func(key string, val *cbg.Deferred) error {
 		called++
@@ -664,6 +665,21 @@ func testForEachParallel(t *testing.T, options ...Option) {
 	}
 
 	err = begn.ForEachParallel(ctx, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, 1001, called)
+
+	loadedRoot, err := LoadNode(ctx, cs, c)
+	require.NoError(t, err)
+	called = 0
+	f = func(key string, val *cbg.Deferred) error {
+		called++
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		require.Equal(t, expectedVal, val.Raw)
+		return nil
+	}
+
+	err = loadedRoot.ForEachParallel(ctx, f, 16)
 	require.NoError(t, err)
 	require.Equal(t, 1001, called)
 }
