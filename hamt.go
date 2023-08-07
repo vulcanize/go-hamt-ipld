@@ -1029,10 +1029,12 @@ func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCid
 				res.children = append(res.children, child{
 					shard: p.cache,
 				})
-			} else {
+			} else if p.Link != cid.Undef {
 				res.children = append(res.children, child{
 					cid: p.Link,
 				})
+			} else {
+				continue
 			}
 		} else {
 			for _, kv := range p.KVs {
@@ -1068,11 +1070,13 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 					shard: p.cache,
 					trail: subTrail,
 				})
-			} else {
+			} else if p.Link != cid.Undef {
 				res.children = append(res.children, trackedChild{
 					cid:   p.Link,
 					trail: subTrail,
 				})
+			} else {
+				continue
 			}
 		} else {
 			for _, kv := range p.KVs {
@@ -1122,11 +1126,13 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 					shard: p.cache,
 					trail: subTrail,
 				})
-			} else {
+			} else if p.Link != cid.Undef {
 				res.children = append(res.children, trackedChild{
 					cid:   p.Link,
 					trail: subTrail,
 				})
+			} else {
+				continue
 			}
 		} else {
 			for _, kv := range p.KVs {
