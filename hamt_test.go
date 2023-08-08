@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	block "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
@@ -25,7 +28,7 @@ func newMockBlocks() *mockBlocks {
 	return &mockBlocks{make(map[cid.Cid]block.Block)}
 }
 
-func (mb *mockBlocks) Get(c cid.Cid) (block.Block, error) {
+func (mb *mockBlocks) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	d, ok := mb.data[c]
 	if ok {
 		return d, nil
@@ -33,7 +36,21 @@ func (mb *mockBlocks) Get(c cid.Cid) (block.Block, error) {
 	return nil, fmt.Errorf("Not Found")
 }
 
-func (mb *mockBlocks) Put(b block.Block) error {
+func (mb *mockBlocks) GetMany(ctx context.Context, cs []cid.Cid) ([]block.Block, []cid.Cid, error) {
+	blocks := make([]block.Block, 0, len(cs))
+	missingCIDs := make([]cid.Cid, 0, len(cs))
+	for _, c := range cs {
+		d, ok := mb.data[c]
+		if !ok {
+			missingCIDs = append(missingCIDs, c)
+		} else {
+			blocks = append(blocks, d)
+		}
+	}
+	return blocks, missingCIDs, nil
+}
+
+func (mb *mockBlocks) Put(ctx context.Context, b block.Block) error {
 	mb.data[b.Cid()] = b
 	return nil
 }
@@ -44,10 +61,22 @@ func randString() string {
 	return hex.EncodeToString(buf)
 }
 
+func randKey() string {
+	buf := make([]byte, 18)
+	rand.Read(buf)
+	return hex.EncodeToString(buf)
+}
+
 func randValue() []byte {
 	buf := make([]byte, 30)
 	rand.Read(buf)
 	return buf
+}
+
+func randCBORValue() *CborByteArray {
+	buf := CborByteArray(make([]byte, 30))
+	rand.Read(buf)
+	return &buf
 }
 
 func dotGraph(n *Node) {
@@ -295,6 +324,171 @@ func testBasic(t *testing.T, options ...Option) {
 	if !bytes.Equal(out, val) {
 		t.Fatal("out bytes were wrong: ", out)
 	}
+}
+
+func TestForEach(t *testing.T) {
+	testForEach(t)
+	testForEachParallel(t)
+}
+
+func testForEach(t *testing.T, options ...Option) {
+	ctx := context.Background()
+	cs := cbor.NewCborStore(newMockBlocks())
+	begn := NewNode(cs, options...)
+
+	val := cborstr("cat dog bear")
+	valueBuf := new(bytes.Buffer)
+	err := val.MarshalCBOR(valueBuf)
+	require.NoError(t, err)
+	err = begn.Set(ctx, "foo", val)
+	require.NoError(t, err)
+
+	kvs := make(map[string][]byte, 1001)
+	kvs["foo"] = valueBuf.Bytes()
+
+	for i := 0; i < 1000; i++ {
+		k := randKey()
+		v := randCBORValue()
+		valueBuf := new(bytes.Buffer)
+		err := v.MarshalCBOR(valueBuf)
+		require.NoError(t, err)
+		err = begn.Set(ctx, k, v)
+		require.NoError(t, err)
+		kvs[k] = valueBuf.Bytes()
+	}
+	require.NoError(t, begn.Flush(ctx))
+
+	called := 0
+	f := func(key string, val interface{}) error {
+		called++
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		cm, ok := val.(cbg.CBORMarshaler)
+		var d *cbg.Deferred
+		if ok {
+			buf := new(bytes.Buffer)
+			if err := cm.MarshalCBOR(buf); err != nil {
+				return err
+			}
+			d = &cbg.Deferred{Raw: buf.Bytes()}
+		} else {
+			return fmt.Errorf("expected CBORMarshaler, got %T", val)
+		}
+		require.Equal(t, expectedVal, d.Raw)
+		return nil
+	}
+
+	err = begn.ForEach(ctx, f)
+	require.NoError(t, err)
+	require.Equal(t, 1001, called)
+}
+
+func testForEachParallel(t *testing.T, options ...Option) {
+	ctx := context.Background()
+	cs := cbor.NewGetManyCborStore(newMockBlocks())
+	begn := NewNode(cs, options...)
+
+	val := cborstr("cat dog bear")
+	valueBuf := new(bytes.Buffer)
+	err := val.MarshalCBOR(valueBuf)
+	require.NoError(t, err)
+	err = begn.Set(ctx, "foo", val)
+	require.NoError(t, err)
+
+	kvs := make(map[string][]byte, 10001)
+	kvs["foo"] = valueBuf.Bytes()
+
+	for i := 0; i < 10000; i++ {
+		k := randKey()
+		v := randCBORValue()
+		valueBuf := new(bytes.Buffer)
+		err := v.MarshalCBOR(valueBuf)
+		require.NoError(t, err)
+		err = begn.Set(ctx, k, v)
+		require.NoError(t, err)
+		kvs[k] = valueBuf.Bytes()
+	}
+	// test before flushing
+	var called uint64 = 0
+	f := func(key string, val interface{}) error {
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		cm, ok := val.(cbg.CBORMarshaler)
+		var d *cbg.Deferred
+		if ok {
+			buf := new(bytes.Buffer)
+			if err := cm.MarshalCBOR(buf); err != nil {
+				return err
+			}
+			d = &cbg.Deferred{Raw: buf.Bytes()}
+		} else {
+			return fmt.Errorf("expected CBORMarshaler, got %T", val)
+		}
+		require.Equal(t, expectedVal, d.Raw)
+		return nil
+	}
+
+	err = begn.ForEachParallel(ctx, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10001), called)
+
+	require.NoError(t, begn.Flush(ctx))
+	c, err := cs.Put(ctx, begn)
+	require.NoError(t, err)
+
+	// test after flushing
+	called = 0
+	f = func(key string, val interface{}) error {
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		cm, ok := val.(cbg.CBORMarshaler)
+		var d *cbg.Deferred
+		if ok {
+			buf := new(bytes.Buffer)
+			if err := cm.MarshalCBOR(buf); err != nil {
+				return err
+			}
+			d = &cbg.Deferred{Raw: buf.Bytes()}
+		} else {
+			return fmt.Errorf("expected CBORMarshaler, got %T", val)
+		}
+		require.Equal(t, expectedVal, d.Raw)
+		return nil
+	}
+
+	err = begn.ForEachParallel(ctx, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10001), called)
+
+	loadedRoot, err := LoadNode(ctx, cs, c)
+	require.NoError(t, err)
+
+	// test with loaded root
+	called = 0
+	f = func(key string, val interface{}) error {
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		cm, ok := val.(cbg.CBORMarshaler)
+		var d *cbg.Deferred
+		if ok {
+			buf := new(bytes.Buffer)
+			if err := cm.MarshalCBOR(buf); err != nil {
+				return err
+			}
+			d = &cbg.Deferred{Raw: buf.Bytes()}
+		} else {
+			return fmt.Errorf("expected CBORMarshaler, got %T", val)
+		}
+		require.Equal(t, expectedVal, d.Raw)
+		return nil
+	}
+
+	err = loadedRoot.ForEachParallel(ctx, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10001), called)
 }
 
 func TestDelete(t *testing.T) {
@@ -584,7 +778,7 @@ func TestValueLinking(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	blk, err := cs.Blocks.Get(tcid)
+	blk, err := cs.Blocks.Get(ctx, tcid)
 	if err != nil {
 		t.Fatal(err)
 	}
