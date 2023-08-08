@@ -1000,26 +1000,41 @@ func (n *Node) ForEachParallelTrackedWithNodeSink(ctx context.Context, trail []i
 	return parallelShardWalkTrackedWithNodeSink(ctx, n, trail, b, sink, f, concurrency)
 }
 
+type child struct {
+	cid   cid.Cid
+	shard *Node
+}
+
 type listCidsAndShards struct {
-	cids   []cid.Cid
-	shards []*Node
+	children []child
+}
+
+type trackedChild struct {
+	cid   cid.Cid
+	shard *Node
+	trail []int
 }
 
 type listCidsAndShardsTracked struct {
-	cids   []cid.Cid
-	shards []*Node
-	trail  []int
+	children []trackedChild
 }
 
 func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCidsAndShards, error) {
 	res := &listCidsAndShards{}
+	res.children = make([]child, 0, len(n.Pointers))
 
 	for _, p := range n.Pointers {
 		if p.isShard() {
 			if p.cache != nil {
-				res.shards = append(res.shards, p.cache)
+				res.children = append(res.children, child{
+					shard: p.cache,
+				})
+			} else if p.Link != cid.Undef {
+				res.children = append(res.children, child{
+					cid: p.Link,
+				})
 			} else {
-				res.cids = append(res.cids, p.Link)
+				continue
 			}
 		} else {
 			for _, kv := range p.KVs {
@@ -1035,7 +1050,7 @@ func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCid
 
 func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
 	res := &listCidsAndShardsTracked{}
-
+	res.children = make([]trackedChild, 0, len(n.Pointers))
 	idx := 0
 	l := len(trail)
 
@@ -1051,11 +1066,18 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 
 		if p.isShard() {
 			if p.cache != nil {
-				res.shards = append(res.shards, p.cache)
+				res.children = append(res.children, trackedChild{
+					shard: p.cache,
+					trail: subTrail,
+				})
+			} else if p.Link != cid.Undef {
+				res.children = append(res.children, trackedChild{
+					cid:   p.Link,
+					trail: subTrail,
+				})
 			} else {
-				res.cids = append(res.cids, p.Link)
+				continue
 			}
-			res.trail = subTrail
 		} else {
 			for _, kv := range p.KVs {
 				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
@@ -1083,6 +1105,7 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 	}
 
 	res := &listCidsAndShardsTracked{}
+	res.children = make([]trackedChild, 0, len(n.Pointers))
 
 	idx := 0
 	l := len(trail)
@@ -1099,11 +1122,18 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 
 		if p.isShard() {
 			if p.cache != nil {
-				res.shards = append(res.shards, p.cache)
+				res.children = append(res.children, trackedChild{
+					shard: p.cache,
+					trail: subTrail,
+				})
+			} else if p.Link != cid.Undef {
+				res.children = append(res.children, trackedChild{
+					cid:   p.Link,
+					trail: subTrail,
+				})
 			} else {
-				res.cids = append(res.cids, p.Link)
+				continue
 			}
-			res.trail = subTrail
 		} else {
 			for _, kv := range p.KVs {
 				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
@@ -1133,29 +1163,30 @@ func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(
 	for i := 0; i < concurrency; i++ {
 		grp.Go(func() error {
 			for feedChildren := range feed {
-				for _, nextShard := range feedChildren.shards {
-					nextChildren, err := nextShard.walkChildren(processShardValues)
-					if err != nil {
-						return err
-					}
+				linksToVisit := make([]cid.Cid, 0, len(feedChildren.children))
+				for _, nextChild := range feedChildren.children {
+					if nextChild.shard != nil {
+						nextChildren, err := nextChild.shard.walkChildren(processShardValues)
+						if err != nil {
+							return err
+						}
+						select {
+						case out <- nextChildren:
+						case <-errGrpCtx.Done():
+							return nil
+						}
+					} else if nextChild.cid != cid.Undef {
+						var shouldVisit bool
 
-					select {
-					case out <- nextChildren:
-					case <-errGrpCtx.Done():
-						return nil
-					}
-				}
+						visitlk.Lock()
+						shouldVisit = visit(nextChild.cid)
+						visitlk.Unlock()
 
-				var linksToVisit []cid.Cid
-				for _, nextCid := range feedChildren.cids {
-					var shouldVisit bool
-
-					visitlk.Lock()
-					shouldVisit = visit(nextCid)
-					visitlk.Unlock()
-
-					if shouldVisit {
-						linksToVisit = append(linksToVisit, nextCid)
+						if shouldVisit {
+							linksToVisit = append(linksToVisit, nextChild.cid)
+						}
+					} else {
+						return fmt.Errorf("invalid child")
 					}
 				}
 
@@ -1209,9 +1240,15 @@ func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(
 	var todoQueue []*listCidsAndShards
 	var inProgress int
 
-	next := &listCidsAndShards{
-		shards: []*Node{root},
+	// start the walk
+	children, err := root.walkChildren(processShardValues)
+	// if we hit an error or there are no children, then we're done
+	if err != nil || children == nil {
+		close(feed)
+		grp.Wait()
+		return err
 	}
+	next := children
 
 dispatcherLoop:
 	for {
@@ -1262,29 +1299,33 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 	for i := 0; i < concurrency; i++ {
 		grp.Go(func() error {
 			for feedChildren := range feed {
-				for _, nextShard := range feedChildren.shards {
-					nextChildren, err := nextShard.walkChildrenTracked(feedChildren.trail, processShardValues)
-					if err != nil {
-						return err
-					}
+				linksToVisit := make([]cid.Cid, 0, len(feedChildren.children))
+				linksToVisitTrails := make([][]int, 0, len(feedChildren.children))
+				for _, nextChild := range feedChildren.children {
+					if nextChild.shard != nil {
+						nextChildren, err := nextChild.shard.walkChildrenTracked(nextChild.trail, processShardValues)
+						if err != nil {
+							return err
+						}
 
-					select {
-					case out <- nextChildren:
-					case <-errGrpCtx.Done():
-						return nil
-					}
-				}
+						select {
+						case out <- nextChildren:
+						case <-errGrpCtx.Done():
+							return nil
+						}
+					} else if nextChild.cid != cid.Undef {
+						var shouldVisit bool
 
-				var linksToVisit []cid.Cid
-				for _, nextCid := range feedChildren.cids {
-					var shouldVisit bool
+						visitlk.Lock()
+						shouldVisit = visit(nextChild.cid)
+						visitlk.Unlock()
 
-					visitlk.Lock()
-					shouldVisit = visit(nextCid)
-					visitlk.Unlock()
-
-					if shouldVisit {
-						linksToVisit = append(linksToVisit, nextCid)
+						if shouldVisit {
+							linksToVisit = append(linksToVisit, nextChild.cid)
+							linksToVisitTrails = append(linksToVisitTrails, nextChild.trail)
+						}
+					} else {
+						return fmt.Errorf("invalid child")
 					}
 				}
 
@@ -1313,7 +1354,7 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 						return err
 					}
 
-					nextChildren, err := nextShard.walkChildrenTracked(feedChildren.trail, processShardValues)
+					nextChildren, err := nextShard.walkChildrenTracked(linksToVisitTrails[cursor.Index], processShardValues)
 					if err != nil {
 						return err
 					}
@@ -1338,10 +1379,15 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 	var todoQueue []*listCidsAndShardsTracked
 	var inProgress int
 
-	next := &listCidsAndShardsTracked{
-		shards: []*Node{root},
-		trail:  trail,
+	// start the walk
+	children, err := root.walkChildrenTracked(trail, processShardValues)
+	// if we hit an error or there are no children, then we're done
+	if err != nil || children == nil {
+		close(feed)
+		grp.Wait()
+		return err
 	}
+	next := children
 
 dispatcherLoop:
 	for {
@@ -1392,29 +1438,33 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 	for i := 0; i < concurrency; i++ {
 		grp.Go(func() error {
 			for feedChildren := range feed {
-				for _, nextShard := range feedChildren.shards {
-					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(feedChildren.trail, b, sink, processShardValues)
-					if err != nil {
-						return err
-					}
+				linksToVisit := make([]cid.Cid, 0, len(feedChildren.children))
+				linksToVisitTrails := make([][]int, 0, len(feedChildren.children))
+				for _, nextChild := range feedChildren.children {
+					if nextChild.shard != nil {
+						nextChildren, err := nextChild.shard.walkChildrenTrackedWithNodeSink(nextChild.trail, b, sink, processShardValues)
+						if err != nil {
+							return err
+						}
 
-					select {
-					case out <- nextChildren:
-					case <-errGrpCtx.Done():
-						return nil
-					}
-				}
+						select {
+						case out <- nextChildren:
+						case <-errGrpCtx.Done():
+							return nil
+						}
+					} else if nextChild.cid != cid.Undef {
+						var shouldVisit bool
 
-				var linksToVisit []cid.Cid
-				for _, nextCid := range feedChildren.cids {
-					var shouldVisit bool
+						visitlk.Lock()
+						shouldVisit = visit(nextChild.cid)
+						visitlk.Unlock()
 
-					visitlk.Lock()
-					shouldVisit = visit(nextCid)
-					visitlk.Unlock()
-
-					if shouldVisit {
-						linksToVisit = append(linksToVisit, nextCid)
+						if shouldVisit {
+							linksToVisit = append(linksToVisit, nextChild.cid)
+							linksToVisitTrails = append(linksToVisitTrails, nextChild.trail)
+						}
+					} else {
+						return fmt.Errorf("invalid child")
 					}
 				}
 
@@ -1443,7 +1493,7 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 						return err
 					}
 
-					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(feedChildren.trail, b, sink, processShardValues)
+					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(linksToVisitTrails[cursor.Index], b, sink, processShardValues)
 					if err != nil {
 						return err
 					}
@@ -1468,10 +1518,15 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 	var todoQueue []*listCidsAndShardsTracked
 	var inProgress int
 
-	next := &listCidsAndShardsTracked{
-		shards: []*Node{root},
-		trail:  trail,
+	// start the walk
+	children, err := root.walkChildrenTrackedWithNodeSink(trail, b, sink, processShardValues)
+	// if we hit an error or there are no children, then we're done
+	if err != nil || children == nil {
+		close(feed)
+		grp.Wait()
+		return err
 	}
+	next := children
 
 dispatcherLoop:
 	for {

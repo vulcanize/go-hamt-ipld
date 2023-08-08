@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -639,10 +640,10 @@ func testForEachParallel(t *testing.T, options ...Option) {
 	err = begn.Set(ctx, "foo", val)
 	require.NoError(t, err)
 
-	kvs := make(map[string][]byte, 1001)
+	kvs := make(map[string][]byte, 10001)
 	kvs["foo"] = valueBuf.Bytes()
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 10000; i++ {
 		k := randKey()
 		v := randValue()
 		valueBuf := new(bytes.Buffer)
@@ -652,12 +653,10 @@ func testForEachParallel(t *testing.T, options ...Option) {
 		require.NoError(t, err)
 		kvs[k] = valueBuf.Bytes()
 	}
-	require.NoError(t, begn.Flush(ctx))
-	c, err := cs.Put(ctx, begn)
-	require.NoError(t, err)
-	called := 0
+	// test before flushing
+	var called uint64 = 0
 	f := func(key string, val *cbg.Deferred) error {
-		called++
+		atomic.AddUint64(&called, 1)
 		expectedVal, ok := kvs[key]
 		require.True(t, ok)
 		require.Equal(t, expectedVal, val.Raw)
@@ -666,13 +665,33 @@ func testForEachParallel(t *testing.T, options ...Option) {
 
 	err = begn.ForEachParallel(ctx, f, 16)
 	require.NoError(t, err)
-	require.Equal(t, 1001, called)
+	require.Equal(t, uint64(10001), called)
+
+	require.NoError(t, begn.Flush(ctx))
+	c, err := cs.Put(ctx, begn)
+	require.NoError(t, err)
+
+	// test after flushing
+	called = 0
+	f = func(key string, val *cbg.Deferred) error {
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		require.Equal(t, expectedVal, val.Raw)
+		return nil
+	}
+
+	err = begn.ForEachParallel(ctx, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10001), called)
 
 	loadedRoot, err := LoadNode(ctx, cs, c)
 	require.NoError(t, err)
+
+	// test with loaded root
 	called = 0
 	f = func(key string, val *cbg.Deferred) error {
-		called++
+		atomic.AddUint64(&called, 1)
 		expectedVal, ok := kvs[key]
 		require.True(t, ok)
 		require.Equal(t, expectedVal, val.Raw)
@@ -681,7 +700,7 @@ func testForEachParallel(t *testing.T, options ...Option) {
 
 	err = loadedRoot.ForEachParallel(ctx, f, 16)
 	require.NoError(t, err)
-	require.Equal(t, 1001, called)
+	require.Equal(t, uint64(10001), called)
 }
 
 func TestSetIfAbsent(t *testing.T) {
