@@ -671,9 +671,13 @@ func parallelShardWalk(ctx context.Context, root *Node, processShardValues func(
 	var todoQueue []*listCidsAndShards
 	var inProgress int
 
-	next := &listCidsAndShards{
-		children: []child{{shard: root}},
+	children, err := root.walkChildren(processShardValues)
+	if err != nil || children == nil {
+		close(feed)
+		grp.Wait()
+		return err
 	}
+	next := children
 
 dispatcherLoop:
 	for {
@@ -801,7 +805,13 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 	var todoQueue []*listCidsAndShardsTracked
 	var inProgress int
 
-	next := &listCidsAndShardsTracked{children: []trackedChild{{shard: root, trail: trail}}}
+	children, err := root.walkChildrenTracked(trail, processShardValues)
+	if err != nil || children == nil {
+		close(feed)
+		grp.Wait()
+		return err
+	}
+	next := children
 
 dispatcherLoop:
 	for {
@@ -929,7 +939,13 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 	var todoQueue []*listCidsAndShardsTracked
 	var inProgress int
 
-	next := &listCidsAndShardsTracked{children: []trackedChild{{shard: root, trail: trail}}}
+	children, err := root.walkChildrenTrackedWithNodeSink(trail, b, sink, processShardValues)
+	if err != nil || children == nil {
+		close(feed)
+		grp.Wait()
+		return err
+	}
+	next := children
 
 dispatcherLoop:
 	for {
