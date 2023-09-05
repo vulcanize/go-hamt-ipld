@@ -847,6 +847,7 @@ func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string,
 		subTrail := make([]int, l, l+1)
 		copy(subTrail, trail)
 		subTrail = append(subTrail, idx)
+		idx++
 
 		if p.isShard() {
 			chnd, err := p.loadChild(ctx, n.store, n.bitWidth, n.hash)
@@ -864,7 +865,6 @@ func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string,
 				}
 			}
 		}
-		idx++
 	}
 	return nil
 }
@@ -899,6 +899,7 @@ func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, trail []int, b *b
 		subTrail := make([]int, l, l+1)
 		copy(subTrail, trail)
 		subTrail = append(subTrail, idx)
+		idx++
 
 		if p.isShard() {
 			chnd, err := p.loadChild(ctx, n.store, n.bitWidth, n.hash)
@@ -916,7 +917,6 @@ func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, trail []int, b *b
 				}
 			}
 		}
-		idx++
 	}
 	return nil
 }
@@ -1415,6 +1415,7 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 		subTrail := make([]int, l, l+1)
 		copy(subTrail, trail)
 		subTrail = append(subTrail, idx)
+		idx++
 
 		if p.isShard() {
 			if p.cache != nil {
@@ -1471,6 +1472,7 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 		subTrail := make([]int, l, l+1)
 		copy(subTrail, trail)
 		subTrail = append(subTrail, idx)
+		idx++
 
 		if p.isShard() {
 			if p.cache != nil {
