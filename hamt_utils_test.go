@@ -3,6 +3,7 @@ package hamt
 import (
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
@@ -55,4 +56,30 @@ func (c *CborByteArray) UnmarshalCBOR(r io.Reader) error {
 func cborstr(s string) *CborByteArray {
 	v := CborByteArray(s)
 	return &v
+}
+
+var _ cbg.CBORUnmarshaler = &CBORSinkCounter{}
+
+type CBORSinkCounter struct {
+	calledTimes uint64
+}
+
+func (c *CBORSinkCounter) UnmarshalCBOR(reader io.Reader) error {
+	atomic.AddUint64(&c.calledTimes, 1)
+	return nil
+}
+
+func uint64Pow(n, m uint64) uint64 {
+	if m == 0 {
+		return 1
+	}
+	result := n
+	for i := uint64(2); i <= m; i++ {
+		result *= n
+	}
+	return result
+}
+
+func toChar(i int) rune {
+	return rune('A' + i)
 }

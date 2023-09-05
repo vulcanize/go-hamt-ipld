@@ -29,6 +29,7 @@ func mkmask(n int) byte {
 // (most) levels.
 func (hb *hashBits) Next(i int) (int, error) {
 	if hb.consumed+i > len(hb.b)*8 {
+		fmt.Printf("hb.consumed: %d, i: %d, len(hb.b)*8: %d hb.b:%x\n", hb.consumed, i, len(hb.b)*8, hb.b)
 		// TODO(rvagg): this msg looks like a UnixFS holdover, it's an overflow
 		// and should probably bubble up a proper Err*
 		return 0, fmt.Errorf("sharded directory too deep")

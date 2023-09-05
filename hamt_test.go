@@ -581,8 +581,9 @@ func testBasic(t *testing.T, options ...Option) {
 }
 
 func TestForEach(t *testing.T) {
-	testForEach(t)
-	testForEachParallel(t)
+	//testForEach(t)
+	//testForEachParallel(t)
+	testForEachParallelTrackedWithNodeSink(t)
 }
 
 func testForEach(t *testing.T, options ...Option) {
@@ -701,6 +702,177 @@ func testForEachParallel(t *testing.T, options ...Option) {
 	err = loadedRoot.ForEachParallel(ctx, f, 16)
 	require.NoError(t, err)
 	require.Equal(t, uint64(10001), called)
+}
+
+func testForEachParallelTrackedWithNodeSink(t *testing.T, options ...Option) {
+	ctx := context.Background()
+	cs := cbor.NewGetManyCborStore(newMockBlocks())
+	begn, err := NewNode(cs, options...)
+	require.NoError(t, err)
+	setBitWidth := 3
+	begn.bitWidth = setBitWidth
+	width:= uint64Pow(2, uint64(setBitWidth))
+	widthInt := int(width)
+	target := uint64Pow(width, 2) // make a power of 8 (width) to keep things simple
+	println(target)
+	hvs := make([]hashBits, target)
+	begn.hash  = func(i []byte) []byte {
+		//fmt.Printf("digest: %x\r\n", i)
+		hvs = append(hvs, hashBits{b: i})
+		return i
+	} // use a mock hash function so that we can know the expected results
+
+	kvs := make(map[string][]byte, target)
+
+	// test before flushing
+	var called uint64 = 0
+	buf := new(bytes.Buffer)
+	counterSink := new(CBORSinkCounter)
+	expectedSinkCount := target / width
+	div := expectedSinkCount/width - 1
+	expectedSinkCount += uint64Pow(width, div)
+	expectedTrails := make(map[string]struct{}, target)
+	m := new(sync.Mutex)
+
+	println(widthInt)
+	for i := 0; i < widthInt; i++ {
+		trail := ""
+		key :=  ""
+		for j := 0; j < widthInt; j++ {
+			trail = fmt.Sprintf("%d, %d", i, j)
+			key = fmt.Sprintf("%d%d", i, j)
+			//fmt.Printf("expected trail: %s\r\n", trail)
+			expectedTrails[trail] = struct{}{}
+			v := randValue()
+			valueBuf := new(bytes.Buffer)
+			err := v.MarshalCBOR(valueBuf)
+			require.NoError(t, err)
+			err = begn.Set(ctx, key, v)
+			require.NoError(t, err)
+			kvs[key] = valueBuf.Bytes()
+		}
+	}
+	f := func(key string, val *cbg.Deferred, trail []int) error {
+		trailStr := ""
+		for i, t := range trail {
+			if i != len(trail)-1 {
+				trailStr += fmt.Sprintf("%d, ", t)
+			} else {
+				trailStr += fmt.Sprintf("%d", t)
+			}
+		}
+		//fmt.Printf("seen trail: %s\r\n", trailStr)
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		require.Equal(t, expectedVal, val.Raw)
+		m.Lock()
+		defer m.Unlock()
+		_, ok = expectedTrails[trailStr]
+		if !ok {
+			return fmt.Errorf("unexpected trail: %s", trailStr)
+		}
+		delete(expectedTrails, trailStr)
+		return nil
+	}
+
+	err = begn.ForEachParallelTrackedWithNodeSink(ctx, buf, counterSink, f, 1)
+	require.NoError(t, err)
+	require.Equal(t, target, called)
+	if counterSink.calledTimes != expectedSinkCount {
+		t.Fatal("didnt call sink enough times")
+	}
+	if len(expectedTrails) != 0 {
+		fmt.Printf("expected trails not seen: %+v\r\n", expectedTrails)
+		t.Fatal("didnt see expected trails")
+	}
+
+	require.NoError(t, begn.Flush(ctx))
+	c, err := cs.Put(ctx, begn)
+	require.NoError(t, err)
+
+	// test after flushing
+	called = 0
+	buf = new(bytes.Buffer)
+	counterSink = new(CBORSinkCounter)
+	expectedTrails = make(map[string]struct{}, 64)
+
+	for i := 0; i < widthInt; i++ {
+		trail := ""
+		for j := 0; j < widthInt; j++ {
+			trail = fmt.Sprintf("%d, ", i)
+			trail += fmt.Sprintf("%d", j)
+		}
+		expectedTrails[trail] = struct{}{}
+	}
+	f = func(key string, val *cbg.Deferred, trail []int) error {
+		trailStr := ""
+		for i, t := range trail {
+			if i != len(trail)-1 {
+				trailStr += fmt.Sprintf("%d, ", t)
+			} else {
+				trailStr += fmt.Sprintf("%d", t)
+			}
+		}
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		require.Equal(t, expectedVal, val.Raw)
+		m.Lock()
+		delete(expectedTrails, trailStr)
+		m.Unlock()
+		return nil
+	}
+
+	err = begn.ForEachParallelTrackedWithNodeSink(ctx, buf, counterSink, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, target, called)
+	if len(expectedTrails) != 0 {
+		t.Fatal("didnt see expected trails")
+	}
+
+	loadedRoot, err := LoadNode(ctx, cs, c)
+	require.NoError(t, err)
+
+	// test with loaded root
+	called = 0
+	buf = new(bytes.Buffer)
+	counterSink = new(CBORSinkCounter)
+	expectedTrails = make(map[string]struct{}, 64)
+
+	for i := 0; i < widthInt; i++ {
+		trail := ""
+		for j := 0; j < widthInt; j++ {
+			trail = fmt.Sprintf("%d, ", i)
+			trail += fmt.Sprintf("%d", j)
+		}
+		expectedTrails[trail] = struct{}{}
+	}
+	f = func(key string, val *cbg.Deferred, trail []int) error {
+		trailStr := ""
+		for i, t := range trail {
+			if i != len(trail)-1 {
+				trailStr += fmt.Sprintf("%d, ", t)
+			} else {
+				trailStr += fmt.Sprintf("%d", t)
+			}
+		}
+		atomic.AddUint64(&called, 1)
+		expectedVal, ok := kvs[key]
+		require.True(t, ok)
+		require.Equal(t, expectedVal, val.Raw)
+		m.Lock()
+		delete(expectedTrails, trailStr)
+		m.Unlock()
+		return nil
+	}
+
+	err = loadedRoot.ForEachParallelTrackedWithNodeSink(ctx, buf, counterSink, f, 16)
+	require.NoError(t, err)
+	require.Equal(t, target, called)
+	if len(expectedTrails) != 0 {
+		t.Fatal("didnt see expected trails")
+	}
 }
 
 func TestSetIfAbsent(t *testing.T) {

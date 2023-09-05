@@ -654,6 +654,135 @@ func (n *Node) cleanChild(chnd *Node, cindex byte) error {
 	return n.setPointer(cindex, &Pointer{KVs: chvals})
 }
 
+func (n *Node) mockModifyValue(ctx context.Context, hv *hashBits, k []byte, v *cbg.Deferred, replace overwrite, trail []int) (modified, [][]int, [][]int, error) {
+	idx, err := hv.Next(n.bitWidth)
+	if err != nil {
+		return UNMODIFIED, nil, nil, ErrMaxDepth
+	}
+	trail = append(trail, idx)
+
+	// if the element expected at this node isn't here then we can be sure it
+	// doesn't exist in the HAMT already and can insert it at the appropriate
+	// position.
+	if n.Bitfield.Bit(idx) != 1 {
+		if v == nil { // Delete absent key
+			return UNMODIFIED, nil, nil,  nil
+		}
+		return MODIFIED, [][]int{trail}, nil, n.insertKV(idx, k, v)
+	}
+
+	// otherwise, the value is either local or in a child
+
+	// perform a popcount of bits up to the `idx` to find `cindex`
+	cindex := byte(n.indexForBitPos(idx))
+
+	child := n.getPointer(cindex)
+	if child.isShard() {
+		// if isShard, we have a pointer to a child that we need to load and
+		// delegate our modify operation to.
+		// Note that this loadChild operation will cause the loaded node to be
+		// "cached" and this pointer to be marked as dirty;
+		// it is an eventual Flush passing back over this "cache" node which
+		// causes the updates made to the in-memory "cache" node to eventually
+		// be persisted.
+		chnd, err := child.loadChild(ctx, n.store, n.bitWidth, n.hash)
+		if err != nil {
+			return UNMODIFIED, nil, nil, err
+		}
+
+		modified, subTrails, removedTrails, err := chnd.mockModifyValue(ctx, hv, k, v, replace, trail)
+		if err != nil {
+			return UNMODIFIED, nil, nil, err
+		}
+
+		if modified {
+			// if we are modifying set the child.dirty
+			// if we are not modifying leave it be, another operation might had set it previously
+			child.dirty = true
+		}
+
+		// CHAMP optimization, ensure the HAMT retains its canonical form for the
+		// current data it contains. This may involve collapsing child nodes if
+		// they no longer contain enough elements to justify their stand-alone
+		// existence.
+		if v == nil {
+			if err := n.cleanChild(chnd, cindex); err != nil {
+				return UNMODIFIED, nil, nil, err
+			}
+		}
+
+		return modified, subTrails, removedTrails, nil
+	}
+
+	// if not isShard, then either the key/value pair is local here and can be
+	// modified (or deleted) here or needs to be added as a new child node if
+	// there is an overflow.
+
+	if v == nil {
+		// delete operation, find the child and remove it, compacting the bucket in
+		// the process
+		for i, p := range child.KVs {
+			if bytes.Equal(p.Key, k) {
+				if len(child.KVs) == 1 {
+					// last element in the bucket, remove it and update the bitfield
+					return MODIFIED, nil, [][]int{trail}, n.rmPointer(cindex, idx)
+				}
+
+				copy(child.KVs[i:], child.KVs[i+1:])
+				child.KVs = child.KVs[:len(child.KVs)-1]
+				return MODIFIED, nil, [][]int{trail}, nil
+			}
+		}
+		return UNMODIFIED, nil, nil, nil // Delete absent key
+	}
+
+	// modify existing, check if key already exists
+	for _, p := range child.KVs {
+		if bytes.Equal(p.Key, k) {
+			if bool(replace) && !bytes.Equal(p.Value.Raw, v.Raw) {
+				p.Value = v
+				return MODIFIED, nil, nil, nil
+			}
+			return UNMODIFIED, nil, nil, nil
+		}
+	}
+
+	if len(child.KVs) >= bucketSize {
+		// bucket is full, create a child node (shard) with all existing bucket
+		// elements plus the new one and set it in the place of the bucket
+		sub := newNode(n.store, n.hash, n.bitWidth)
+		hvcopy := &hashBits{b: hv.b, consumed: hv.consumed}
+		_, subTrails, removedTrails, err := sub.mockModifyValue(ctx, hvcopy, k, v, replace, trail)
+		if err != nil {
+			return UNMODIFIED, nil, nil, err
+		}
+
+		for _, p := range child.KVs {
+			chhv := &hashBits{b: n.hash(p.Key), consumed: hv.consumed}
+			_, s, r, err := sub.mockModifyValue(ctx, chhv, p.Key, p.Value, replace, trail)
+			if err != nil {
+				return UNMODIFIED, nil, nil, err
+			}
+			subTrails = append(subTrails, s...)
+			removedTrails = append(removedTrails, r...)
+		}
+
+		return MODIFIED, append(subTrails, trail), removedTrails, n.setPointer(cindex, &Pointer{cache: sub, dirty: true})
+	}
+
+	// otherwise insert the new element into the array in order, the ordering is
+	// important to retain canonical form
+	np := &KV{Key: k, Value: v}
+	for i := 0; i < len(child.KVs); i++ {
+		if bytes.Compare(k, child.KVs[i].Key) < 0 {
+			child.KVs = append(child.KVs[:i], append([]*KV{np}, child.KVs[i:]...)...)
+			return MODIFIED, [][]int{trail}, nil, nil
+		}
+	}
+	child.KVs = append(child.KVs, np)
+	return MODIFIED, [][]int{trail}, nil, nil
+}
+
 // Add a new value, update an existing value, or delete a value from the HAMT,
 // potentially recursively calling child nodes to find the exact location of
 // the entry in question and potentially collapsing nodes into buckets in
@@ -664,6 +793,7 @@ func (n *Node) cleanChild(chnd *Node, cindex byte) error {
 func (n *Node) modifyValue(ctx context.Context, hv *hashBits, k []byte, v *cbg.Deferred, replace overwrite) (modified, error) {
 	idx, err := hv.Next(n.bitWidth)
 	if err != nil {
+		println("HERE")
 		return UNMODIFIED, ErrMaxDepth
 	}
 
@@ -901,14 +1031,14 @@ func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string,
 	idx := 0
 	l := len(trail)
 	for _, p := range n.Pointers {
-		// Seek the next set bit in the bitfield to find the actual index for this pointer
+		// Seek the next set bit in	 the bitfield to find the actual index for this pointer
 		for n.Bitfield.Bit(idx) == 0 {
 			idx++
 		}
 
 		subTrail := make([]int, l, l+1)
 		copy(subTrail, trail)
-		subTrail = append(subTrail, idx)
+		subTrail = append(subTrail, idx) // right now the paths we emit are the paths to the pointer in a node.. maybe should just be to the node?
 
 		if p.isShard() {
 			chnd, err := p.loadChild(ctx, n.store, n.bitWidth, n.hash)
@@ -920,7 +1050,7 @@ func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string,
 				return err
 			}
 		} else {
-			for _, kv := range p.KVs {
+			for _, kv := range p.KVs { // does selector include index position of KV in pointer, or just the path to the pointer? ... Or just the path to the node containing the pointer?
 				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
 					return err
 				}
@@ -992,12 +1122,12 @@ func (n *Node) ForEachParallel(ctx context.Context, f func(k string, val *cbg.De
 	return parallelShardWalk(ctx, n, f, concurrency)
 }
 
-func (n *Node) ForEachParallelTracked(ctx context.Context, trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
-	return parallelShardWalkTracked(ctx, n, trail, f, concurrency)
+func (n *Node) ForEachParallelTracked(ctx context.Context, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	return parallelShardWalkTracked(ctx, n, []int{}, f, concurrency)
 }
 
-func (n *Node) ForEachParallelTrackedWithNodeSink(ctx context.Context, trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
-	return parallelShardWalkTrackedWithNodeSink(ctx, n, trail, b, sink, f, concurrency)
+func (n *Node) ForEachParallelTrackedWithNodeSink(ctx context.Context, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	return parallelShardWalkTrackedWithNodeSink(ctx, n, []int{}, b, sink, f, concurrency)
 }
 
 type child struct {
@@ -1085,6 +1215,7 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 				}
 			}
 		}
+		idx++
 	}
 
 	return res, nil
@@ -1110,7 +1241,8 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 	idx := 0
 	l := len(trail)
 
-	for _, p := range n.Pointers {
+	fmt.Printf("pointers len: %d\r\n", len(n.Pointers))
+	for i, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
 		for n.Bitfield.Bit(idx) == 0 {
 			idx++
@@ -1119,6 +1251,7 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 		subTrail := make([]int, l, l+1)
 		copy(subTrail, trail)
 		subTrail = append(subTrail, idx)
+		fmt.Printf("subtrail: %x\r\n", subTrail)
 
 		if p.isShard() {
 			if p.cache != nil {
@@ -1135,12 +1268,17 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sin
 				continue
 			}
 		} else {
+			fmt.Printf("kv length: %d\r\n", len(p.KVs))
+			fmt.Printf("trail: %x\r\n", subTrail)
 			for _, kv := range p.KVs {
 				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
 					return nil, err
 				}
 			}
 		}
+		println(i)
+		println(idx)
+		idx++
 	}
 
 	return res, nil
