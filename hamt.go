@@ -1091,12 +1091,9 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 	return res, nil
 }
 
-func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
+func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
 	if sink != nil {
-		if b == nil {
-			b = bytes.NewBuffer(nil)
-		}
-		b.Reset()
+		b := bytes.NewBuffer(nil)
 		if err := n.MarshalCBOR(b); err != nil {
 			return nil, err
 		}
@@ -1424,7 +1421,7 @@ dispatcherLoop:
 }
 
 // parallelShardWalkTrackedWithNodeSink walks the HAMT concurrently processing callbacks upon encountering leaf nodes
-func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail []int, sink cbg.CBORUnmarshaler, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
 	var visitlk sync.Mutex
 	visitSet := cid.NewSet()
 	visit := visitSet.Visit
@@ -1521,7 +1518,7 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 	var inProgress int
 
 	// start the walk
-	children, err := root.walkChildrenTrackedWithNodeSink(trail, b, sink, processShardValues)
+	children, err := root.walkChildrenTrackedWithNodeSink(trail, sink, processShardValues)
 	// if we hit an error or there are no children, then we're done
 	if err != nil || children == nil {
 		close(feed)
