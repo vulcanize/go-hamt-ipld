@@ -896,19 +896,19 @@ func (n *Node) ForEach(ctx context.Context, f func(k string, val *cbg.Deferred) 
 // This performs a full traversal of the graph and for large HAMTs can cause
 // a large number of loads from the underlying store.
 // The values are returned as raw bytes, not decoded.
-// This method also provides the trail of indices to the current node, which can be used to formulate a selector suffix
-func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) error {
+// This method also provides the path of indices to the current node, which can be used to formulate a selector suffix
+func (n *Node) ForEachTracked(ctx context.Context, path []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) error {
 	idx := 0
-	l := len(trail)
+	l := len(path)
 	for _, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
 		for n.Bitfield.Bit(idx) == 0 {
 			idx++
 		}
 
-		subTrail := make([]int, l, l+1)
-		copy(subTrail, trail)
-		subTrail = append(subTrail, idx)
+		subPath := make([]int, l, l+1)
+		copy(subPath, path)
+		subPath = append(subPath, idx)
 		idx++
 
 		if p.isShard() {
@@ -917,12 +917,12 @@ func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string,
 				return err
 			}
 
-			if err := chnd.ForEachTracked(ctx, subTrail, f); err != nil {
+			if err := chnd.ForEachTracked(ctx, subPath, f); err != nil {
 				return err
 			}
 		} else {
 			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
+				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
 					return err
 				}
 			}
@@ -935,9 +935,9 @@ func (n *Node) ForEachTracked(ctx context.Context, trail []int, f func(k string,
 // This performs a full traversal of the graph and for large HAMTs can cause
 // a large number of loads from the underlying store.
 // The values are returned as raw bytes, not decoded.
-// This method also provides the trail of indices to the current node, which can be used to formulate a selector suffix
+// This method also provides the path of indices to the current node, which can be used to formulate a selector suffix
 // This method also provides a callback to sink the current node
-func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) error {
+func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, path []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) error {
 	if sink != nil {
 		if b == nil {
 			b = bytes.NewBuffer(nil)
@@ -951,16 +951,16 @@ func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, trail []int, b *b
 		}
 	}
 	idx := 0
-	l := len(trail)
+	l := len(path)
 	for _, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
 		for n.Bitfield.Bit(idx) == 0 {
 			idx++
 		}
 
-		subTrail := make([]int, l, l+1)
-		copy(subTrail, trail)
-		subTrail = append(subTrail, idx)
+		subPath := make([]int, l, l+1)
+		copy(subPath, path)
+		subPath = append(subPath, idx)
 		idx++
 
 		if p.isShard() {
@@ -969,12 +969,12 @@ func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, trail []int, b *b
 				return err
 			}
 
-			if err := chnd.ForEachTrackedWithNodeSink(ctx, subTrail, b, sink, f); err != nil {
+			if err := chnd.ForEachTrackedWithNodeSink(ctx, subPath, b, sink, f); err != nil {
 				return err
 			}
 		} else {
 			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
+				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
 					return err
 				}
 			}
@@ -992,12 +992,12 @@ func (n *Node) ForEachParallel(ctx context.Context, f func(k string, val *cbg.De
 	return parallelShardWalk(ctx, n, f, concurrency)
 }
 
-func (n *Node) ForEachParallelTracked(ctx context.Context, trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
-	return parallelShardWalkTracked(ctx, n, trail, f, concurrency)
+func (n *Node) ForEachParallelTracked(ctx context.Context, path []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	return parallelShardWalkTracked(ctx, n, path, f, concurrency)
 }
 
-func (n *Node) ForEachParallelTrackedWithNodeSink(ctx context.Context, trail []int, b *bytes.Buffer, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
-	return parallelShardWalkTrackedWithNodeSink(ctx, n, trail, b, sink, f, concurrency)
+func (n *Node) ForEachParallelTrackedWithNodeSink(ctx context.Context, path []int, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+	return parallelShardWalkTrackedWithNodeSink(ctx, n, path, sink, f, concurrency)
 }
 
 type child struct {
@@ -1012,7 +1012,7 @@ type listCidsAndShards struct {
 type trackedChild struct {
 	cid   cid.Cid
 	shard *Node
-	trail []int
+	path  []int
 }
 
 type listCidsAndShardsTracked struct {
@@ -1048,11 +1048,11 @@ func (n *Node) walkChildren(f func(k string, val *cbg.Deferred) error) (*listCid
 	return res, nil
 }
 
-func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
+func (n *Node) walkChildrenTracked(path []int, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
 	res := &listCidsAndShardsTracked{}
 	res.children = make([]trackedChild, 0, len(n.Pointers))
 	idx := 0
-	l := len(trail)
+	l := len(path)
 
 	for _, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
@@ -1060,28 +1060,28 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 			idx++
 		}
 
-		subTrail := make([]int, l, l+1)
-		copy(subTrail, trail)
-		subTrail = append(subTrail, idx)
+		subPath := make([]int, l, l+1)
+		copy(subPath, path)
+		subPath = append(subPath, idx)
 		idx++
 
 		if p.isShard() {
 			if p.cache != nil {
 				res.children = append(res.children, trackedChild{
 					shard: p.cache,
-					trail: subTrail,
+					path:  subPath,
 				})
 			} else if p.Link != cid.Undef {
 				res.children = append(res.children, trackedChild{
-					cid:   p.Link,
-					trail: subTrail,
+					cid:  p.Link,
+					path: subPath,
 				})
 			} else {
 				continue
 			}
 		} else {
 			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
+				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
 					return nil, err
 				}
 			}
@@ -1091,7 +1091,7 @@ func (n *Node) walkChildrenTracked(trail []int, f func(k string, val *cbg.Deferr
 	return res, nil
 }
 
-func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
+func (n *Node) walkChildrenTrackedWithNodeSink(path []int, sink cbg.CBORUnmarshaler, f func(k string, val *cbg.Deferred, selectorSuffix []int) error) (*listCidsAndShardsTracked, error) {
 	if sink != nil {
 		b := bytes.NewBuffer(nil)
 		if err := n.MarshalCBOR(b); err != nil {
@@ -1106,7 +1106,7 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, sink cbg.CBORUnmarsh
 	res.children = make([]trackedChild, 0, len(n.Pointers))
 
 	idx := 0
-	l := len(trail)
+	l := len(path)
 
 	for _, p := range n.Pointers {
 		// Seek the next set bit in the bitfield to find the actual index for this pointer
@@ -1114,28 +1114,28 @@ func (n *Node) walkChildrenTrackedWithNodeSink(trail []int, sink cbg.CBORUnmarsh
 			idx++
 		}
 
-		subTrail := make([]int, l, l+1)
-		copy(subTrail, trail)
-		subTrail = append(subTrail, idx)
+		subPath := make([]int, l, l+1)
+		copy(subPath, path)
+		subPath = append(subPath, idx)
 		idx++
 
 		if p.isShard() {
 			if p.cache != nil {
 				res.children = append(res.children, trackedChild{
 					shard: p.cache,
-					trail: subTrail,
+					path:  subPath,
 				})
 			} else if p.Link != cid.Undef {
 				res.children = append(res.children, trackedChild{
-					cid:   p.Link,
-					trail: subTrail,
+					cid:  p.Link,
+					path: subPath,
 				})
 			} else {
 				continue
 			}
 		} else {
 			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subTrail); err != nil {
+				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
 					return nil, err
 				}
 			}
@@ -1282,7 +1282,7 @@ dispatcherLoop:
 }
 
 // parallelShardWalkTracked walks the HAMT concurrently processing callbacks upon encountering leaf nodes
-func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+func parallelShardWalkTracked(ctx context.Context, root *Node, path []int, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
 	var visitlk sync.Mutex
 	visitSet := cid.NewSet()
 	visit := visitSet.Visit
@@ -1302,7 +1302,7 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 				linksToVisitTrails := make([][]int, 0, len(feedChildren.children))
 				for _, nextChild := range feedChildren.children {
 					if nextChild.shard != nil {
-						nextChildren, err := nextChild.shard.walkChildrenTracked(nextChild.trail, processShardValues)
+						nextChildren, err := nextChild.shard.walkChildrenTracked(nextChild.path, processShardValues)
 						if err != nil {
 							return err
 						}
@@ -1321,7 +1321,7 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 
 						if shouldVisit {
 							linksToVisit = append(linksToVisit, nextChild.cid)
-							linksToVisitTrails = append(linksToVisitTrails, nextChild.trail)
+							linksToVisitTrails = append(linksToVisitTrails, nextChild.path)
 						}
 					} else {
 						return fmt.Errorf("invalid child")
@@ -1379,7 +1379,7 @@ func parallelShardWalkTracked(ctx context.Context, root *Node, trail []int, proc
 	var inProgress int
 
 	// start the walk
-	children, err := root.walkChildrenTracked(trail, processShardValues)
+	children, err := root.walkChildrenTracked(path, processShardValues)
 	// if we hit an error or there are no children, then we're done
 	if err != nil || children == nil {
 		close(feed)
@@ -1421,7 +1421,7 @@ dispatcherLoop:
 }
 
 // parallelShardWalkTrackedWithNodeSink walks the HAMT concurrently processing callbacks upon encountering leaf nodes
-func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail []int, sink cbg.CBORUnmarshaler, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
+func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, path []int, sink cbg.CBORUnmarshaler, processShardValues func(k string, val *cbg.Deferred, selectorSuffix []int) error, concurrency int) error {
 	var visitlk sync.Mutex
 	visitSet := cid.NewSet()
 	visit := visitSet.Visit
@@ -1441,7 +1441,7 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 				linksToVisitTrails := make([][]int, 0, len(feedChildren.children))
 				for _, nextChild := range feedChildren.children {
 					if nextChild.shard != nil {
-						nextChildren, err := nextChild.shard.walkChildrenTrackedWithNodeSink(nextChild.trail, b, sink, processShardValues)
+						nextChildren, err := nextChild.shard.walkChildrenTrackedWithNodeSink(nextChild.path, sink, processShardValues)
 						if err != nil {
 							return err
 						}
@@ -1460,7 +1460,7 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 
 						if shouldVisit {
 							linksToVisit = append(linksToVisit, nextChild.cid)
-							linksToVisitTrails = append(linksToVisitTrails, nextChild.trail)
+							linksToVisitTrails = append(linksToVisitTrails, nextChild.path)
 						}
 					} else {
 						return fmt.Errorf("invalid child")
@@ -1492,7 +1492,7 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 						return err
 					}
 
-					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(linksToVisitTrails[cursor.Index], b, sink, processShardValues)
+					nextChildren, err := nextShard.walkChildrenTrackedWithNodeSink(linksToVisitTrails[cursor.Index], sink, processShardValues)
 					if err != nil {
 						return err
 					}
@@ -1518,7 +1518,7 @@ func parallelShardWalkTrackedWithNodeSink(ctx context.Context, root *Node, trail
 	var inProgress int
 
 	// start the walk
-	children, err := root.walkChildrenTrackedWithNodeSink(trail, sink, processShardValues)
+	children, err := root.walkChildrenTrackedWithNodeSink(path, sink, processShardValues)
 	// if we hit an error or there are no children, then we're done
 	if err != nil || children == nil {
 		close(feed)

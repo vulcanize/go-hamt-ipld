@@ -36,7 +36,7 @@ func ParallelDiff(ctx context.Context, prevBs, curBs cbor.IpldStore, prev, cur c
 }
 
 // ParallelDiff returns a set of changes that transform node 'prev' into node 'cur'. opts are applied to both prev and cur.
-func ParallelDiffTrackedWithNodeSink(ctx context.Context, prevBs, curBs cbor.IpldStore, prev, cur cid.Cid, workers int64, b *bytes.Buffer, sink cbg.CBORUnmarshaler, opts ...Option) ([]*TrackedChange, error) {
+func ParallelDiffTrackedWithNodeSink(ctx context.Context, prevBs, curBs cbor.IpldStore, prev, cur cid.Cid, workers int64, sink cbg.CBORUnmarshaler, opts ...Option) ([]*TrackedChange, error) {
 	if prev.Equals(cur) {
 		return nil, nil
 	}
@@ -55,7 +55,7 @@ func ParallelDiffTrackedWithNodeSink(ctx context.Context, prevBs, curBs cbor.Ipl
 		return nil, xerrors.Errorf("diffing HAMTs with differing bitWidths not supported (prev=%d, cur=%d)", prevHamt.bitWidth, curHamt.bitWidth)
 	}
 
-	return doParallelDiffNodeTrackedWithNodeSink(ctx, prevHamt, curHamt, workers, b, sink, []int{})
+	return doParallelDiffNodeTrackedWithNodeSink(ctx, prevHamt, curHamt, workers, sink, []int{})
 }
 
 func doParallelDiffNode(ctx context.Context, pre, cur *Node, workers int64) ([]*Change, error) {
@@ -98,7 +98,7 @@ func doParallelDiffNode(ctx context.Context, pre, cur *Node, workers int64) ([]*
 	return changes, err
 }
 
-func doParallelDiffNodeTrackedWithNodeSink(ctx context.Context, pre, cur *Node, workers int64, b *bytes.Buffer, sink cbg.CBORUnmarshaler, trail []int) ([]*TrackedChange, error) {
+func doParallelDiffNodeTrackedWithNodeSink(ctx context.Context, pre, cur *Node, workers int64, sink cbg.CBORUnmarshaler, path []int) ([]*TrackedChange, error) {
 	bp := cur.Bitfield.BitLen()
 	if pre.Bitfield.BitLen() > bp {
 		bp = pre.Bitfield.BitLen()
@@ -116,7 +116,7 @@ func doParallelDiffNodeTrackedWithNodeSink(ctx context.Context, pre, cur *Node, 
 				cur:    cur,
 				curBit: curBit,
 			},
-			trail: trail,
+			path: path,
 		})
 	}
 
@@ -153,7 +153,7 @@ type task struct {
 
 type trackedTask struct {
 	task
-	trail []int
+	path []int
 }
 
 func newDiffScheduler(ctx context.Context, numWorkers int64, rootTasks ...*task) (*diffScheduler, context.Context) {
@@ -182,6 +182,19 @@ func newTrackedWithNodeSinkDiffScheduler(ctx context.Context, numWorkers int64, 
 	return s, ctx
 }
 
+type diffScheduler struct {
+	// number of worker routine to spawn
+	numWorkers int64
+	// buffer holds tasks until they are processed
+	stack []*task
+	// inbound and outbound tasks
+	in, out chan *task
+	// tracks number of inflight tasks
+	taskWg sync.WaitGroup
+	// launches workers and collects errors if any occur
+	grp *errgroup.Group
+}
+
 type trackedScheduler struct {
 	// number of worker routine to spawn
 	numWorkers int64
@@ -195,19 +208,6 @@ type trackedScheduler struct {
 	grp *errgroup.Group
 	// node sink
 	sink cbg.CBORUnmarshaler
-}
-
-type diffScheduler struct {
-	// number of worker routine to spawn
-	numWorkers int64
-	// buffer holds tasks until they are processed
-	stack []*task
-	// inbound and outbound tasks
-	in, out chan *task
-	// tracks number of inflight tasks
-	taskWg sync.WaitGroup
-	// launches workers and collects errors if any occur
-	grp *errgroup.Group
 }
 
 func (s *diffScheduler) enqueueTask(task *task) {
@@ -462,10 +462,20 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 	curBit := todo.curBit
 	cur := todo.cur
 
-	l := len(todo.trail)
-	subTrail := make([]int, l, l+1)
-	copy(subTrail, todo.trail)
-	subTrail = append(subTrail, idx)
+	if t.sink != nil {
+		b := bytes.NewBuffer(nil)
+		if err := cur.MarshalCBOR(b); err != nil {
+			return err
+		}
+		if err := t.sink.UnmarshalCBOR(b); err != nil {
+			return err
+		}
+	}
+
+	l := len(todo.path)
+	subPath := make([]int, l, l+1)
+	copy(subPath, todo.path)
+	subPath = append(subPath, idx)
 	switch {
 	case preBit == 1 && curBit == 1:
 		// index for pre and cur will be unique to each, calculate it here.
@@ -501,7 +511,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 						cur:    curChild,
 						curBit: curBit,
 					},
-					trail: subTrail,
+					path: subPath,
 				})
 			}
 
@@ -511,7 +521,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 			if err != nil {
 				return err
 			}
-			parallelDiffKVsTracked(childKV, curPointer.KVs, subTrail, results)
+			parallelDiffKVsTracked(childKV, curPointer.KVs, subPath, results)
 
 		// check if KV's from pre exists in any children of cur's child.
 		case !prePointer.isShard() && curPointer.isShard():
@@ -519,11 +529,11 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 			if err != nil {
 				return err
 			}
-			parallelDiffKVsTracked(prePointer.KVs, childKV, subTrail, results)
+			parallelDiffKVsTracked(prePointer.KVs, childKV, subPath, results)
 
 		// both contain KVs, compare.
 		case !prePointer.isShard() && !curPointer.isShard():
-			parallelDiffKVsTracked(prePointer.KVs, curPointer.KVs, subTrail, results)
+			parallelDiffKVsTracked(prePointer.KVs, curPointer.KVs, subPath, results)
 		}
 	case preBit == 1 && curBit == 0:
 		// there exists a value in previous not found in current - it was removed
@@ -534,7 +544,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 			if err != nil {
 				return err
 			}
-			err = parallelRemoveAllTracked(ctx, child, subTrail, results)
+			err = parallelRemoveAllTracked(ctx, child, subPath, results)
 			if err != nil {
 				return err
 			}
@@ -547,7 +557,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 						Before: p.Value,
 						After:  nil,
 					},
-					Path: subTrail,
+					Path: subPath,
 				}
 			}
 		}
@@ -560,7 +570,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 			if err != nil {
 				return err
 			}
-			err = parallelAddAllTracked(ctx, child, subTrail, results)
+			err = parallelAddAllTrackedWithNodeSink(ctx, child, subPath, t.sink, results)
 			if err != nil {
 				return err
 			}
@@ -573,7 +583,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 						Before: nil,
 						After:  p.Value,
 					},
-					Path: subTrail,
+					Path: subPath,
 				}
 			}
 		}
@@ -625,7 +635,7 @@ func parallelDiffKVs(pre, cur []*KV, out chan *Change) {
 	}
 }
 
-func parallelDiffKVsTracked(pre, cur []*KV, trail []int, out chan *TrackedChange) {
+func parallelDiffKVsTracked(pre, cur []*KV, path []int, out chan *TrackedChange) {
 	preMap := make(map[string]*cbg.Deferred, len(pre))
 	curMap := make(map[string]*cbg.Deferred, len(cur))
 
@@ -645,7 +655,7 @@ func parallelDiffKVsTracked(pre, cur []*KV, trail []int, out chan *TrackedChange
 					Before: value,
 					After:  nil,
 				},
-				Path: trail,
+				Path: path,
 			}
 		}
 	}
@@ -660,7 +670,7 @@ func parallelDiffKVsTracked(pre, cur []*KV, trail []int, out chan *TrackedChange
 					Before: nil,
 					After:  curVal,
 				},
-				Path: trail,
+				Path: path,
 			}
 		} else {
 			if !bytes.Equal(preVal.Raw, curVal.Raw) {
@@ -671,7 +681,7 @@ func parallelDiffKVsTracked(pre, cur []*KV, trail []int, out chan *TrackedChange
 						Before: preVal,
 						After:  curVal,
 					},
-					Path: trail,
+					Path: path,
 				}
 			}
 		}
@@ -690,8 +700,8 @@ func parallelAddAll(ctx context.Context, node *Node, out chan *Change) error {
 	})
 }
 
-func parallelAddAllTracked(ctx context.Context, node *Node, trail []int, out chan *TrackedChange) error {
-	return node.ForEach(ctx, func(k string, val *cbg.Deferred) error {
+func parallelAddAllTrackedWithNodeSink(ctx context.Context, node *Node, initialPath []int, sink cbg.CBORUnmarshaler, out chan *TrackedChange) error {
+	return node.ForEachParallelTrackedWithNodeSink(ctx, initialPath, sink, func(k string, val *cbg.Deferred, path []int) error {
 		out <- &TrackedChange{
 			Change: Change{
 				Type:   Add,
@@ -699,10 +709,10 @@ func parallelAddAllTracked(ctx context.Context, node *Node, trail []int, out cha
 				Before: nil,
 				After:  val,
 			},
-			Path: trail,
+			Path: path,
 		}
 		return nil
-	})
+	}, 16)
 }
 
 func parallelRemoveAll(ctx context.Context, node *Node, out chan *Change) error {
@@ -717,8 +727,8 @@ func parallelRemoveAll(ctx context.Context, node *Node, out chan *Change) error 
 	})
 }
 
-func parallelRemoveAllTracked(ctx context.Context, node *Node, trail []int, out chan *TrackedChange) error {
-	return node.ForEach(ctx, func(k string, val *cbg.Deferred) error {
+func parallelRemoveAllTracked(ctx context.Context, node *Node, initialPath []int, out chan *TrackedChange) error {
+	return node.ForEachParallelTracked(ctx, initialPath, func(k string, val *cbg.Deferred, path []int) error {
 		out <- &TrackedChange{
 			Change: Change{
 				Type:   Remove,
@@ -726,8 +736,8 @@ func parallelRemoveAllTracked(ctx context.Context, node *Node, trail []int, out 
 				Before: val,
 				After:  nil,
 			},
-			Path: trail,
+			Path: path,
 		}
 		return nil
-	})
+	}, 16)
 }
