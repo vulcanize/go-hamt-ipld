@@ -921,8 +921,11 @@ func (n *Node) ForEachTracked(ctx context.Context, path []int, f func(k string, 
 				return err
 			}
 		} else {
-			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
+			for i, kv := range p.KVs {
+				kvPath := make([]int, l+1, l+2)
+				copy(kvPath, subPath)
+				kvPath = append(kvPath, i)
+				if err := f(string(kv.Key), kv.Value, kvPath); err != nil {
 					return err
 				}
 			}
@@ -973,8 +976,11 @@ func (n *Node) ForEachTrackedWithNodeSink(ctx context.Context, path []int, b *by
 				return err
 			}
 		} else {
-			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
+			for i, kv := range p.KVs {
+				kvPath := make([]int, l+1, l+2)
+				copy(kvPath, subPath)
+				kvPath = append(kvPath, i)
+				if err := f(string(kv.Key), kv.Value, kvPath); err != nil {
 					return err
 				}
 			}
@@ -1080,8 +1086,11 @@ func (n *Node) walkChildrenTracked(path []int, f func(k string, val *cbg.Deferre
 				continue
 			}
 		} else {
-			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
+			for i, kv := range p.KVs {
+				kvPath := make([]int, l+1, l+2)
+				copy(kvPath, subPath)
+				kvPath = append(kvPath, i)
+				if err := f(string(kv.Key), kv.Value, kvPath); err != nil {
 					return nil, err
 				}
 			}
@@ -1134,8 +1143,11 @@ func (n *Node) walkChildrenTrackedWithNodeSink(path []int, sink cbg.CBORUnmarsha
 				continue
 			}
 		} else {
-			for _, kv := range p.KVs {
-				if err := f(string(kv.Key), kv.Value, subPath); err != nil {
+			for i, kv := range p.KVs {
+				kvPath := make([]int, l+1, l+2)
+				copy(kvPath, subPath)
+				kvPath = append(kvPath, i)
+				if err := f(string(kv.Key), kv.Value, kvPath); err != nil {
 					return nil, err
 				}
 			}

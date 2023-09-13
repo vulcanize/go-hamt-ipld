@@ -549,7 +549,10 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 				return err
 			}
 		} else {
-			for _, p := range pointer.KVs {
+			for i, p := range pointer.KVs {
+				kvPath := make([]int, l+1, l+2)
+				copy(kvPath, subPath)
+				kvPath = append(kvPath, i)
 				results <- &TrackedChange{
 					Change: Change{
 						Type:   Remove,
@@ -557,7 +560,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 						Before: p.Value,
 						After:  nil,
 					},
-					Path: subPath,
+					Path: kvPath,
 				}
 			}
 		}
@@ -575,7 +578,10 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 				return err
 			}
 		} else {
-			for _, p := range pointer.KVs {
+			for i, p := range pointer.KVs {
+				kvPath := make([]int, l+1, l+2)
+				copy(kvPath, subPath)
+				kvPath = append(kvPath, i)
 				results <- &TrackedChange{
 					Change: Change{
 						Type:   Add,
@@ -583,7 +589,7 @@ func (t *trackedScheduler) work(ctx context.Context, todo *trackedTask, results 
 						Before: nil,
 						After:  p.Value,
 					},
-					Path: subPath,
+					Path: kvPath,
 				}
 			}
 		}
@@ -636,52 +642,59 @@ func parallelDiffKVs(pre, cur []*KV, out chan *Change) {
 }
 
 func parallelDiffKVsTracked(pre, cur []*KV, path []int, out chan *TrackedChange) {
-	preMap := make(map[string]*cbg.Deferred, len(pre))
-	curMap := make(map[string]*cbg.Deferred, len(cur))
+	preMap := make(map[string]valAndIndex, len(pre))
+	curMap := make(map[string]valAndIndex, len(cur))
 
-	for _, kv := range pre {
-		preMap[string(kv.Key)] = kv.Value
+	for i, kv := range pre {
+		preMap[string(kv.Key)] = valAndIndex{val: kv.Value, index: i}
 	}
-	for _, kv := range cur {
-		curMap[string(kv.Key)] = kv.Value
+	for i, kv := range cur {
+		curMap[string(kv.Key)] = valAndIndex{val: kv.Value, index: i}
 	}
+	l := len(path)
 	// find removed keys: keys in pre and not in cur
-	for key, value := range preMap {
+	for key, preVal := range preMap {
 		if _, ok := curMap[key]; !ok {
+			kvPath := make([]int, l, l+1)
+			copy(kvPath, path)
+			kvPath = append(kvPath, preVal.index)
 			out <- &TrackedChange{
 				Change: Change{
 					Type:   Remove,
 					Key:    key,
-					Before: value,
+					Before: preVal.val,
 					After:  nil,
 				},
-				Path: path,
+				Path: kvPath,
 			}
 		}
 	}
 	// find added keys: keys in cur and not in pre
 	// find modified values: keys in cur and pre with different values
 	for key, curVal := range curMap {
+		kvPath := make([]int, l, l+1)
+		copy(kvPath, path)
+		kvPath = append(kvPath, curVal.index)
 		if preVal, ok := preMap[key]; !ok {
 			out <- &TrackedChange{
 				Change: Change{
 					Type:   Add,
 					Key:    key,
 					Before: nil,
-					After:  curVal,
+					After:  curVal.val,
 				},
-				Path: path,
+				Path: kvPath,
 			}
 		} else {
-			if !bytes.Equal(preVal.Raw, curVal.Raw) {
+			if !bytes.Equal(preVal.val.Raw, curVal.val.Raw) {
 				out <- &TrackedChange{
 					Change: Change{
 						Type:   Modify,
 						Key:    key,
-						Before: preVal,
-						After:  curVal,
+						Before: preVal.val,
+						After:  curVal.val,
 					},
-					Path: path,
+					Path: kvPath,
 				}
 			}
 		}
