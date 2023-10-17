@@ -16,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/multiformats/go-multihash"
+
+	"github.com/filecoin-project/lotus/chain/types/ethtypes"
 	block "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
@@ -190,6 +193,14 @@ func TestCanonicalStructureAlternateBitWidth(t *testing.T) {
 }
 
 func TestOverflow(t *testing.T) {
+	// a := "bafy2bzaced2iw3caqsqj3ew5doa6quvakbw3ioow7ex5i5g45byrwlxd7hnmy"
+	println(len("d3f35459b41ae2ab2dfbc193b3b9528c851cd4a5523b049b1ba9956db4a8b639"))
+	by, _ := hex.DecodeString("d3f35459b41ae2ab2dfbc193b3b9528c851cd4a5523b049b1ba9956db4a8b639")
+	mh, _ := multihash.EncodeName(by, "blake2b-256")
+	c := cid.NewCidV1(cid.DagCBOR, mh)
+	eh, _ := ethtypes.ParseEthHash("0xd3f35459b41ae2ab2dfbc193b3b9528c851cd4a5523b049b1ba9956db4a8b639")
+	println(eh.ToCid().String())
+	println(c.String())
 	keys := make([]string, 4)
 	for i := range keys {
 		keys[i] = strings.Repeat("A", 32) + fmt.Sprintf("%d", i)
